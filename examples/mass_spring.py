@@ -267,6 +267,14 @@ def forward(output=None, visualize=True):
 
     loss[None] = 0
     compute_loss(steps - 1)
+    forward.output_loss.append(loss[None])
+    fig = plt.figure()
+    plt.plot(forward.output_loss)
+    fig.savefig('plots/0.png', dpi=fig.dpi)
+    plt.close(fig)
+
+
+forward.output_loss = []
 
 
 @ti.kernel

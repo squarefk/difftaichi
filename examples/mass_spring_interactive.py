@@ -13,8 +13,13 @@ ti.init(default_fp=real)
 
 max_steps = 4096
 vis_interval = 256
-output_vis_interval = 8
+
 steps = 2048 // 2
+output_vis_interval = steps // 120
+output_target = []
+output_sim = []
+output_loss = []
+
 assert steps * 2 <= max_steps
 
 scalar = lambda: ti.field(dtype=real)
@@ -26,7 +31,7 @@ x = vec()
 v = vec()
 v_inc = vec()
 
-head_id = 10
+head_id = 6
 goal = vec()
 
 n_objects = 0
@@ -37,7 +42,10 @@ gravity = -1.8
 friction = 2.5
 
 gradient_clip = 1
-spring_omega = 10
+cycle_period = 100
+turn_period = 400
+spring_omega = 2 * math.pi / 0.004 / cycle_period
+print(spring_omega)
 damping = 15
 
 n_springs = 0
@@ -57,13 +65,18 @@ bias2 = scalar()
 hidden = scalar()
 
 center = vec()
+duplicate_v = 0
+duplicate_h = 0
 target_v = vec()
+target_h = ti.field(ti.f64, shape=())
+weight_v = 1.
+weight_h = 1.
 
 act = scalar()
 
 
 def n_input_states():
-    return n_sin_waves + 4 * n_objects + 2
+    return n_sin_waves + 4 * n_objects + 2 * duplicate_v + duplicate_h
 
 
 @ti.layout
@@ -113,9 +126,13 @@ def nn1(t: ti.i32):
                                                                   j][0] * 0.05
             actuation += weights1[i, j * 4 + n_sin_waves + 3] * v[t,
                                                                   j][1] * 0.05
-        actuation += weights1[i, n_objects * 4 + n_sin_waves] * target_v[t][0]
-        actuation += weights1[i,
-                              n_objects * 4 + n_sin_waves + 1] * target_v[t][1]
+        if ti.static(duplicate_v > 0):
+            for j in ti.static(range(duplicate_v)):
+                actuation += weights1[i, n_objects * 4 + n_sin_waves + j * 2] * target_v[t][0]
+                actuation += weights1[i, n_objects * 4 + n_sin_waves + j * 2 + 1] * target_v[t][1]
+        if ti.static(duplicate_h > 0):
+            for j in ti.static(range(duplicate_h)):
+                actuation += weights1[i, n_objects * 4 + n_sin_waves + duplicate_v * 2 + j] * target_h[None]
         actuation += bias1[i]
         actuation = ti.tanh(actuation)
         hidden[t, i] = actuation
@@ -140,12 +157,18 @@ def apply_spring_force(t: ti.i32):
         pos_a = x[t, a]
         pos_b = x[t, b]
         dist = pos_a - pos_b
-        length = dist.norm() + 1e-4
+        length = dist.norm(1e-8) + 1e-4
 
         target_length = spring_length[i] * (1.0 +
                                             spring_actuation[i] * act[t, i])
         impulse = dt * (length -
                         target_length) * spring_stiffness[i] / length * dist
+
+        # Dashpot damping
+        x_ij = x[t, a] - x[t, b]
+        d = x_ij.normalized()
+        v_rel = (v[t, a] - v[t, b]).dot(d)
+        impulse += .2 * v_rel * d
 
         ti.atomic_add(v_inc[t + 1, a], -impulse)
         ti.atomic_add(v_inc[t + 1, b], impulse)
@@ -154,7 +177,8 @@ def apply_spring_force(t: ti.i32):
 @ti.kernel
 def advance_toi(t: ti.i32):
     for i in range(n_objects):
-        s = math.exp(-dt * damping)
+        # s = math.exp(-dt * damping)
+        s = 1
         old_v = s * v[t - 1, i] + dt * gravity * ti.Vector([0.0, 1.0
                                                             ]) + v_inc[t, i]
         old_x = x[t - 1, i]
@@ -170,9 +194,25 @@ def advance_toi(t: ti.i32):
         x[t, i] = new_x
 
 
+
+@ti.kernel
+def compute_loss_x(total_steps: ti.i32):
+    loss[None] = x[0, head_id](0)-x[total_steps, head_id](0)
+
 @ti.kernel
 def compute_loss(t: ti.i32):
-    ti.atomic_add(loss[None], dt * (target_v[t][0] - v[t, head_id][0])**2)
+    # c = ti.Vector([0.0, 0.0])
+    # for i in ti.static(range(n_objects)):
+    #     c += v[t, i]
+    # c = (1.0 / n_objects) * c
+    # ti.atomic_add(loss[None], dt * weight_v * (target_v[t][0] - c[0])**2)
+    ti.atomic_add(loss[None], dt * weight_v * (target_v[t][0] - v[t, head_id][0])**2)
+
+
+@ti.kernel
+def compute_loss_h(t: ti.i32):
+    # ti.atomic_add(loss[None], weight_h * (target_h[None] - center[t][1])**2)
+    ti.atomic_add(loss[None], weight_h * (target_h[None] - x[t, head_id][1])**2)
 
 
 gui = ti.GUI("Mass Spring Robot", (512, 512), background_color=0xFFFFFF)
@@ -195,9 +235,16 @@ def forward(output=None, visualize=True):
     pool = [(random.random() - 0.5) * 2 for _ in range(100)]
     for i in range(total_steps):
         if output:
-            target_v[i][0] = (i // 300) % 2 * 2 - 1
+            target_v[i][0] = ((i // turn_period) % 2 * 2 - 1) * 1
         else:
-            target_v[i][0] = pool[i // 300]
+            target_v[i][0] = (pool[i // turn_period] * 2) * 1
+        if target_v[i][0] < 0:
+            target_v[i][0] = -target_v[i][0]
+        target_v[i][0] = 0.2
+    if output:
+        target_h[None] = 0.5
+    else:
+        target_h[None] = 0.4 + random.random() * 0.2
 
     for t in range(1, total_steps):
         compute_center(t - 1)
@@ -205,21 +252,28 @@ def forward(output=None, visualize=True):
         nn2(t - 1)
         apply_spring_force(t - 1)
         advance_toi(t)
-        compute_loss(t)
+        if duplicate_v > 0:
+            compute_loss(t)
+        if duplicate_h > 0 and t % cycle_period == cycle_period // 2:
+            compute_loss_h(t - 1)
+        # output_target.append(target_v[t][0])
+        # output_sim.append(v[t, head_id][0])
+        output_target.append(target_h[None])
+        output_sim.append(x[t, head_id][1])
 
         if (t + 1) % interval == 0 and visualize:
             gui.clear()
-            gui.line((0, ground_height), (1, ground_height),
+            gui.line((0, ground_height * 0.5), (1, ground_height * 0.5),
                      color=0x0,
                      radius=3)
 
             def circle(x, y, color):
-                gui.circle((x, y), ti.rgb_to_hex(color), 7)
+                gui.circle((x, y), ti.rgb_to_hex(color), 3)
 
             for i in range(n_springs):
 
                 def get_pt(x):
-                    return (x[0], x[1])
+                    return (x[0] * 0.5 + 0.2, x[1] * 0.5)
 
                 a = act[t - 1, i] * 0.5
                 r = 2
@@ -232,13 +286,13 @@ def forward(output=None, visualize=True):
                 gui.line(get_pt(x[t, spring_anchor_a[i]]),
                          get_pt(x[t, spring_anchor_b[i]]),
                          color=c,
-                         radius=r)
+                         radius=r / 2)
 
             for i in range(n_objects):
                 color = (0.4, 0.6, 0.6)
                 if i == head_id:
                     color = (0.8, 0.2, 0.3)
-                circle(x[t, i][0], x[t, i][1], color)
+                circle(x[t, i][0] * 0.5 + 0.2, x[t, i][1] * 0.5, color)
             # circle(goal[None][0], goal[None][1], (0.6, 0.2, 0.2))
 
             if target_v[t][0] > 0:
@@ -252,6 +306,27 @@ def forward(output=None, visualize=True):
                 gui.show('mass_spring/{}/{:04d}.png'.format(output, t))
             else:
                 gui.show()
+    compute_loss_x(total_steps - 1)
+
+    output_loss.append(loss[None])
+    fig = plt.figure()
+    temp_loss = gaussian_filter(output_loss, 10)
+    plt.plot(temp_loss)
+    fig.savefig('plots/' + str(forward.cnt) + '.png', dpi=fig.dpi)
+    plt.close(fig)
+
+    # fig = plt.figure()
+    # plt.plot(range(len(output_target)), output_target, 'o', markersize=2, label="target")
+    # plt.plot(range(len(output_sim)), output_sim, 'o', markersize=2, label="train")
+    # output_target.clear()
+    # output_sim.clear()
+    # plt.legend()
+    # forward.cnt += 1
+    # fig.savefig('plots/' + str(forward.cnt) + '.png', dpi=fig.dpi)
+    # plt.close(fig)
+
+
+forward.cnt = 0
 
 
 @ti.kernel
@@ -283,7 +358,7 @@ def setup_robot(objects, springs):
         spring_anchor_a[i] = s[0]
         spring_anchor_b[i] = s[1]
         spring_length[i] = s[2]
-        spring_stiffness[i] = s[3]
+        spring_stiffness[i] = s[3] / 10
         spring_actuation[i] = s[4]
 
 
